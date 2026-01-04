@@ -3,10 +3,10 @@
 
 #include <cstdio>
 #include <cstring>
-#include <string>
 #include <string_view>
 #include <stdexcept>
 #include <cstdarg>
+#include <unistd.h>     // write()
 
 #pragma pack(push, 1)
 struct MoldHeaderRaw {
@@ -27,56 +27,27 @@ static inline uint64_t be64(const uint8_t* p) {
            (uint64_t(p[4]) << 24) | (uint64_t(p[5]) << 16) | (uint64_t(p[6]) << 8)  | uint64_t(p[7]);
 }
 
-static std::string sanitize_string(const uint8_t* p, size_t n) {
-    std::string s(reinterpret_cast<const char*>(p), n);
-    for (char& c : s) {
-        if (c == '\0') c = ' ';
+// No allocations: print fixed strings directly with precision, replace '\0' with space while copying into output.
+static inline size_t append_sanitized_fixed(char* out, size_t cap, const uint8_t* p, size_t n) {
+    size_t w = 0;
+    while (w < n && w < cap) {
+        char c = (char)p[w];
+        out[w] = (c == '\0') ? ' ' : c;
+        ++w;
     }
-    return s;
+    return w;
 }
 
-static void print_field_value(const uint8_t* base, const FieldSpec& f, const DecodeOptions& opt) {
-    const uint8_t* p = base + f.offset;
-
-    if (opt.verbose) {
-        std::printf("%s: ", f.name.c_str());
-    }
-
-    switch (f.type) {
-        case FieldType::CHAR: {
-            char c = char(p[0]);
-            std::printf("%c", c);
-            break;
-        }
-        case FieldType::UINT8: {
-            std::printf("%u", unsigned(p[0]));
-            break;
-        }
-        case FieldType::UINT32: {
-            if (f.size != 4) throw std::runtime_error("UINT32 field size must be 4: " + f.name);
-            std::printf("%u", be32(p));
-            break;
-        }
-        case FieldType::UINT64: {
-            if (f.size != 8) throw std::runtime_error("UINT64 field size must be 8: " + f.name);
-            std::printf("%llu", (unsigned long long)be64(p));
-            break;
-        }
-        case FieldType::STRING: {
-            // print as visible string (spaces preserved)
-            std::string s = sanitize_string(p, f.size);
-            if (opt.print_hex_strings) {
-                // optional debug mode: show raw bytes too
-                std::printf("%s", s.c_str());
-            } else {
-                std::printf("%s", s.c_str());
-            }
-            break;
-        }
-        default:
-            std::printf("?");
-            break;
-    }
+static inline int append(char*& cur, char* end, const char* fmt, ...) {
+    if (cur >= end) return 0;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(cur, (size_t)(end - cur), fmt, ap);
+    va_end(ap);
+    if (n <= 0) return 0;
+    if (cur + n > end) { cur = end; return 0; }
+    cur += n;
+    return n;
 }
 
 static const MsgSpec* find_spec(uint8_t msg_type) {
@@ -86,24 +57,62 @@ static const MsgSpec* find_spec(uint8_t msg_type) {
     return &it->second;
 }
 
+static inline void append_field(char*& cur, char* end, const uint8_t* msg_base, const FieldSpec& f, const DecodeOptions& opt) {
+    const uint8_t* p = msg_base + f.offset;
+
+    // leading quote already printed by caller
+    if (opt.verbose) {
+        append(cur, end, "%s: ", f.name.c_str());
+    }
+
+    switch (f.type) {
+        case FieldType::CHAR:
+            append(cur, end, "%c", (char)p[0]);
+            break;
+        case FieldType::UINT8:
+            append(cur, end, "%u", (unsigned)p[0]);
+            break;
+        case FieldType::UINT32:
+            if (f.size != 4) throw std::runtime_error("UINT32 size != 4 for field: " + f.name);
+            append(cur, end, "%u", be32(p));
+            break;
+        case FieldType::UINT64:
+            if (f.size != 8) throw std::runtime_error("UINT64 size != 8 for field: " + f.name);
+            append(cur, end, "%llu", (unsigned long long)be64(p));
+            break;
+        case FieldType::STRING: {
+            // write raw fixed-length bytes into output (sanitized)
+            // avoid printf("%.*s") because it stops at '\0'
+            size_t cap = (size_t)(end - cur);
+            size_t wrote = append_sanitized_fixed(cur, cap, p, f.size);
+            cur += wrote;
+            break;
+        }
+        default:
+            append(cur, end, "?");
+            break;
+    }
+}
+
 void decode_moldudp64_packet(const uint8_t* buf, size_t len, const DecodeOptions& opt) {
     if (len < sizeof(MoldHeaderRaw)) return;
 
     const auto* h = reinterpret_cast<const MoldHeaderRaw*>(buf);
-
     std::string_view session(h->session, 10);
 
-    // decode header BE (safe without relying on alignment)
     uint64_t seq = be64(reinterpret_cast<const uint8_t*>(&h->sequence_number_be));
     uint16_t cnt = be16(reinterpret_cast<const uint8_t*>(&h->message_count_be));
 
     size_t off = sizeof(MoldHeaderRaw);
 
-    // End-of-session: 0xFFFF is common sentinel in MoldUDP64 usage
     if (cnt == 0xFFFF) {
-        std::printf(">> {'%.*s', %llu, %u}\n",
-                    (int)session.size(), session.data(),
-                    (unsigned long long)seq, (unsigned)cnt);
+        char out[256];
+        char* cur = out;
+        char* end = out + sizeof(out);
+        append(cur, end, ">> {'%.*s', %llu, %u}\n",
+               (int)session.size(), session.data(),
+               (unsigned long long)seq, (unsigned)cnt);
+        (void)!write(1, out, (size_t)(cur - out));
         return;
     }
 
@@ -119,42 +128,36 @@ void decode_moldudp64_packet(const uint8_t* buf, size_t len, const DecodeOptions
         uint8_t msg_type = msg[0];
 
         const MsgSpec* spec = find_spec(msg_type);
+
+        // Build one full line then single write()
+        char out[4096];
+        char* cur = out;
+        char* end = out + sizeof(out);
+
+        // Header portion like your style:
+        // >> {'SESSION', SEQ, COUNT,'T',
+        append(cur, end, ">> {'%.*s', %llu, %u,'%c'",
+               (int)session.size(), session.data(),
+               (unsigned long long)(seq + i),
+               (unsigned)cnt,
+               (char)msg_type);
+
         if (!spec) {
-            // unknown type: still print header info
-            std::printf(">> {'%.*s', %llu, %u,'?'}\n",
-                        (int)session.size(), session.data(),
-                        (unsigned long long)(seq + i), (unsigned)cnt);
+            append(cur, end, "}\n");
+            (void)!write(1, out, (size_t)(cur - out));
             off += msg_len;
             continue;
         }
 
-        // (Optional sanity) msg_len should match spec->total_length
-        // Some feeds may wrap or extend; in strict mode you can enforce equality.
-        if (spec->total_length != msg_len) {
-            // Don’t crash the harness; print a warning-like line
-            // (Production version: you may want to count / log and skip)
-            // std::fprintf(stderr, "WARN: len mismatch type %c spec=%u msg=%u\n",
-            //              char(msg_type), spec->total_length, msg_len);
+        // Print each field as: , 'value'
+        for (size_t fi = 0; fi < spec->fields.size(); ++fi) {
+            append(cur, end, ", '");
+            append_field(cur, end, msg, spec->fields[fi], opt);
+            append(cur, end, "'");
         }
 
-        // Print in your format (single line per message)
-        std::printf(">> {'%.*s', %llu, %u,' %c', ",
-                    (int)session.size(), session.data(),
-                    (unsigned long long)(seq + i),
-                    (unsigned)cnt,
-                    char(msg_type));
-
-        bool first = true;
-        for (const auto& f : spec->fields) {
-            if (!first) std::printf(", ");
-            first = false;
-
-            std::printf("'");
-            print_field_value(msg, f, opt);
-            std::printf("'");
-        }
-
-        std::printf("}\n");
+        append(cur, end, "}\n");
+        (void)!write(1, out, (size_t)(cur - out));
 
         off += msg_len;
     }
