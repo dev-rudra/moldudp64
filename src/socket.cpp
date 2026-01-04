@@ -82,3 +82,12 @@ int UdpMcastReceiver::recv(uint8_t* buf, int cap) {
     if (fd_ < 0) return -1;
     return (int)::recvfrom(fd_, buf, cap, 0, nullptr, nullptr);
 }
+
+// recvmmsg() batching
+int UdpMcastReceiver::recv_batch(struct mmsghdr* msgvec, int vlen) {
+    if (fd_ < 0) return -1;
+
+    // MSG_WAITFORONE: block until at least one packet arrives,
+    // then return as soon as we have >=1 (and grab more if already queued).
+    return ::recvmmsg(fd_, msgvec, vlen, MSG_WAITFORONE, nullptr);
+}

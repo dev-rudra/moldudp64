@@ -2,6 +2,7 @@
 
 #include <string>
 #include <cstdint>
+#include <sys/socket.h>
 
 class UdpMcastReceiver {
 public:
@@ -17,6 +18,10 @@ public:
     // Receive one datagram
     // returns bytes received, 0/neg on error
     int recv(uint8_t* buf, int cap);
+
+    // Receive up to vlen packets in one syscall.
+    // Returns number of packets received, or -1 on error/timeout.
+    int recv_batch(struct mmsghdr* msgvec, int vlen);
 
     // Optional: increase OS receive buffer
     bool set_rcvbuf(int bytes);
