@@ -16,6 +16,19 @@ struct MoldHeaderRaw {
 };
 #pragma pack(pop)
 
+static const MsgSpec* g_fast_specs[256] = {nullptr};
+
+static void init_fast_specs() {
+    static bool initialized = false;
+    if (initialized) return;
+
+    for (const auto& kv : config().msg_specs) {
+        unsigned char t = static_cast<unsigned char>(kv.first);
+        g_fast_specs[t] = &kv.second;
+    }
+    initialized = true;
+}
+
 static inline uint16_t be16(const uint8_t* p) {
     return (uint16_t(p[0]) << 8) | uint16_t(p[1]);
 }
@@ -48,13 +61,6 @@ static inline int append(char*& cur, char* end, const char* fmt, ...) {
     if (cur + n > end) { cur = end; return 0; }
     cur += n;
     return n;
-}
-
-static const MsgSpec* find_spec(uint8_t msg_type) {
-    const auto& specs = config().msg_specs;
-    auto it = specs.find(char(msg_type));
-    if (it == specs.end()) return nullptr;
-    return &it->second;
 }
 
 static inline void append_field(char*& cur, char* end, const uint8_t* msg_base, const FieldSpec& f, const DecodeOptions& opt) {
@@ -95,6 +101,7 @@ static inline void append_field(char*& cur, char* end, const uint8_t* msg_base, 
 }
 
 void decode_moldudp64_packet(const uint8_t* buf, size_t len, const DecodeOptions& opt) {
+    init_fast_specs();
     if (len < sizeof(MoldHeaderRaw)) return;
 
     const auto* h = reinterpret_cast<const MoldHeaderRaw*>(buf);
@@ -127,7 +134,7 @@ void decode_moldudp64_packet(const uint8_t* buf, size_t len, const DecodeOptions
         const uint8_t* msg = buf + off;
         uint8_t msg_type = msg[0];
 
-        const MsgSpec* spec = find_spec(msg_type);
+        const MsgSpec* spec = g_fast_specs[msg_type];
 
         // Build one full line then single write()
         char out[4096];
