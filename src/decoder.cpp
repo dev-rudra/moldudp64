@@ -99,10 +99,18 @@ static inline void append_field(char*& cur, char* end, const uint8_t* msg_base, 
             break;
     }
 }
-
-void decode_moldudp64_packet(const uint8_t* buf, size_t len, const DecodeOptions& opt) {
+size_t decode_moldudp64_packet_to_buffer(
+    const uint8_t* buf, size_t len,
+    const DecodeOptions& opt,
+    char* out, size_t out_cap)
+{
     init_fast_specs();
-    if (len < sizeof(MoldHeaderRaw)) return;
+
+    if (!buf || len < sizeof(MoldHeaderRaw) || !out || out_cap == 0)
+        return 0;
+
+    char* cur = out;
+    char* end = out + out_cap;
 
     const auto* h = reinterpret_cast<const MoldHeaderRaw*>(buf);
     std::string_view session(h->session, 10);
@@ -112,15 +120,12 @@ void decode_moldudp64_packet(const uint8_t* buf, size_t len, const DecodeOptions
 
     size_t off = sizeof(MoldHeaderRaw);
 
+    // End-of-session
     if (cnt == 0xFFFF) {
-        char out[256];
-        char* cur = out;
-        char* end = out + sizeof(out);
         append(cur, end, ">> {'%.*s', %llu, %u}\n",
-               (int)session.size(), session.data(),
-               (unsigned long long)seq, (unsigned)cnt);
-        (void)!write(1, out, (size_t)(cur - out));
-        return;
+                (int)session.size(), session.data(),
+                (unsigned long long)seq, (unsigned)cnt);
+        return (size_t)(cur - out);
     }
 
     for (uint16_t i = 0; i < cnt; ++i) {
@@ -133,39 +138,27 @@ void decode_moldudp64_packet(const uint8_t* buf, size_t len, const DecodeOptions
 
         const uint8_t* msg = buf + off;
         uint8_t msg_type = msg[0];
-
         const MsgSpec* spec = g_fast_specs[msg_type];
 
-        // Build one full line then single write()
-        char out[4096];
-        char* cur = out;
-        char* end = out + sizeof(out);
-
-        // Header portion like your style:
-        // >> {'SESSION', SEQ, COUNT,'T',
         append(cur, end, ">> {'%.*s', %llu, %u,'%c'",
-               (int)session.size(), session.data(),
-               (unsigned long long)(seq + i),
-               (unsigned)cnt,
-               (char)msg_type);
+                (int)session.size(), session.data(),
+                (unsigned long long)(seq + i),
+                (unsigned)cnt,
+                (char)msg_type);
 
-        if (!spec) {
-            append(cur, end, "}\n");
-            (void)!write(1, out, (size_t)(cur - out));
-            off += msg_len;
-            continue;
-        }
-
-        // Print each field as: , 'value'
-        for (size_t fi = 0; fi < spec->fields.size(); ++fi) {
-            append(cur, end, ", '");
-            append_field(cur, end, msg, spec->fields[fi], opt);
-            append(cur, end, "'");
+        if (spec) {
+            for (const auto& f : spec->fields) {
+                append(cur, end, ", '");
+                append_field(cur, end, msg, f, opt);
+                append(cur, end, "'");
+            }
         }
 
         append(cur, end, "}\n");
-        (void)!write(1, out, (size_t)(cur - out));
+        if (cur >= end) break;
 
         off += msg_len;
     }
+
+    return (size_t)(cur - out);
 }

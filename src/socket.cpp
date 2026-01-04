@@ -1,8 +1,10 @@
-#include "socket.h"
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
+#include "socket.h"
 #include <cstring>
 #include <iostream>
-
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
