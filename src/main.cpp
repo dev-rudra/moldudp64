@@ -1,11 +1,13 @@
 #include "config.h"
 #include "decoder.h"
 #include "socket.h"
+#include "recovery.h"
 
 #include <csignal>
 #include <iostream>
 #include <cstring>
 #include <unistd.h>
+#include <getopt.h>
 
 #include <sys/socket.h> // mmsghdr
 #include <sys/uio.h>    // iovec
@@ -39,8 +41,38 @@ static bool read_mold_header(const uint8_t* buf, size_t len,
     return true;
 }
 
-int main() {
+static void usage(const char* prog) {
+    std::cerr
+        << "Usage: " << prog << " [-g] [-s <seq>] [-n <count>] [-v]\n\n"
+        << "Options:\n"
+        << "  -g            Enable gap-fill (rerequest missing sequences)\n"
+        << "  -s <seq>      Start expected sequence at <seq> (implies gap-fill is useful)\n"
+        << "  -n <count>    Stop after decoding <count> messages (QA testing)\n"
+        << "  -v            Verbose decode (field names etc. if decoder supports)\n";
+}
+
+int main(int argc, char** argv) {
     std::signal(SIGINT, on_sigint);
+
+    bool enable_gap_fill = false;   // <-- default OFF (safe)
+    bool verbose = false;
+    uint64_t start_seq = 0;
+    uint64_t max_msgs = 0;
+
+    int opt;
+    while ((opt = ::getopt(argc, argv, "hgs:n:v")) != -1) {
+        switch (opt) {
+            case 'h': usage(argv[0]); return 0;
+            case 'g': enable_gap_fill = true; break;
+            case 's':
+                start_seq = std::stoull(optarg);
+                // do NOT force enable_gap_fill automatically; user must pass -g
+                break;
+            case 'n': max_msgs = std::stoull(optarg); break;
+            case 'v': verbose = true; break;
+            default: usage(argv[0]); return 1;
+        }
+    }
 
     try {
         load_config("config/config.ini");
@@ -51,6 +83,7 @@ int main() {
 
     const auto& cfg = config();
 
+    // Multicast RX
     UdpMcastReceiver rx;
     if (!rx.open(cfg.net.mcast_ip,
                  cfg.net.mcast_port,
@@ -59,17 +92,28 @@ int main() {
         std::cerr << "FATAL: multicast open failed\n";
         return 1;
     }
-
     rx.set_rcvbuf(4 * 1024 * 1024);
 
-    DecodeOptions opt;
-    opt.verbose = false;
+    // Decoder options
+    DecodeOptions opt_dec;
+    opt_dec.verbose = verbose;
 
-    // one write per UDP packet
+    // Rerequester (only used if -g passed)
+    Rerequester rr;
+    bool rr_ok = false;
+    if (enable_gap_fill) {
+        rr_ok = rr.open(cfg.net.rerequest_ip.c_str(), cfg.net.rerequest_port);
+        if (!rr_ok) {
+            std::cerr << "WARN: gap-fill requested but rerequester open failed; disabling gap-fill\n";
+            enable_gap_fill = false;
+        }
+    }
+
+    // One write per UDP packet (decoder writes into this buffer)
     alignas(64) static char outbuf[256 * 1024];
 
-    // --- batch receive ---
-    constexpr int BATCH = 32;   // tune: 16/32/64
+    // Batch receive
+    constexpr int BATCH = 32;
     constexpr int MTU   = 65536;
 
     alignas(64) static uint8_t bufs[BATCH][MTU];
@@ -85,13 +129,18 @@ int main() {
         msgs[i].msg_hdr.msg_iovlen = 1;
     }
 
-    uint64_t expected_seq = 0;
+    uint64_t expected_seq = start_seq;  // 0 means "sync to first packet"
+    uint64_t total_msgs = 0;
 
     while (!g_stop) {
+        if (max_msgs > 0 && total_msgs >= max_msgs) break;
+
         int n = rx.recv_batch(msgs, BATCH);
         if (n <= 0) continue;
 
         for (int i = 0; i < n; ++i) {
+            if (max_msgs > 0 && total_msgs >= max_msgs) break;
+
             size_t bytes = (size_t)msgs[i].msg_len;
             if (bytes == 0) continue;
 
@@ -101,33 +150,51 @@ int main() {
 
             if (!read_mold_header(bufs[i], bytes, session10, seq, cnt)) continue;
 
+            // Sync expected seq to first packet (live mode)
             if (expected_seq == 0) expected_seq = seq;
 
-            // GAP DETECT
-            if (seq > expected_seq) {
-                uint64_t gap = seq - expected_seq;
-                std::cerr << "WARN: GAP expected=" << expected_seq
-                          << " got=" << seq
-                          << " missing=" << gap
-                          << " session=" << std::string(session10, 10)
-                          << "\n";
-
-                // QA-level behavior for now: resync to live
-                expected_seq = seq;
-            } else if (seq < expected_seq) {
-                // stale/duplicate packet
+            // End session marker (optional)
+            if (cnt == 0xFFFF) {
+                std::cerr << "INFO: END session=" << std::string(session10, 10)
+                          << " seq=" << seq << "\n";
                 continue;
             }
 
-            // decode + write
-            size_t outn = decode_moldudp64_packet_to_buffer(bufs[i], bytes, opt, outbuf, sizeof(outbuf));
+            // GAP detection
+            if (seq > expected_seq) {
+                uint64_t gap = seq - expected_seq;
+
+                std::cerr << "GAP session=" << std::string(session10, 10)
+                          << " range=" << expected_seq << "-" << (seq - 1)
+                          << " count=" << gap << "\n";
+
+                if (enable_gap_fill && rr_ok) {
+                    uint64_t rec = rr.recover(session10, expected_seq, gap, opt_dec);
+                    expected_seq += rec;
+
+                    if (rec < gap) {
+                        std::cerr << "WARN: RECOVERY partial recovered=" << rec
+                                  << " still_missing=" << (gap - rec) << "\n";
+                    }
+                }
+
+                // Sync to live packet after recovery attempt
+                expected_seq = seq;
+            } else if (seq < expected_seq) {
+                // stale/duplicate
+                continue;
+            }
+
+            // Decode live packet (one write per packet)
+            size_t outn = decode_moldudp64_packet_to_buffer(bufs[i], bytes, opt_dec, outbuf, sizeof(outbuf));
             if (outn) (void)!::write(1, outbuf, outn);
 
-            // advance expected
-            if (cnt != 0xFFFF) expected_seq += cnt;
+            // Count & advance state
+            total_msgs += cnt;
+            expected_seq += cnt;
         }
     }
 
-    std::cout << "INFO : stopped\n";
+    std::cerr << "INFO: stopped msgs=" << total_msgs << " expected_seq=" << expected_seq << "\n";
     return 0;
 }
