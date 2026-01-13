@@ -4,23 +4,42 @@
 
 #include <csignal>
 #include <iostream>
-#include <cstring>      // memset
-#include <unistd.h>     // write()
+#include <cstring>
+#include <unistd.h>
 
-#if defined(__linux__)
-  #include <sys/socket.h> // mmsghdr
-  #include <sys/uio.h>    // iovec
-#endif
+#include <sys/socket.h> // mmsghdr
+#include <sys/uio.h>    // iovec
 
 static volatile std::sig_atomic_t g_stop = 0;
+static void on_sigint(int) { g_stop = 1; }
 
-static void on_sigint(int) {
-    g_stop = 1;
+#pragma pack(push, 1)
+struct MoldHeaderRaw {
+    char     session[10];
+    uint64_t sequence_number_be;
+    uint16_t message_count_be;
+};
+#pragma pack(pop)
+
+static inline uint16_t be16(const uint8_t* p) {
+    return (uint16_t(p[0]) << 8) | uint16_t(p[1]);
+}
+static inline uint64_t be64(const uint8_t* p) {
+    return (uint64_t(p[0]) << 56) | (uint64_t(p[1]) << 48) | (uint64_t(p[2]) << 40) | (uint64_t(p[3]) << 32) |
+           (uint64_t(p[4]) << 24) | (uint64_t(p[5]) << 16) | (uint64_t(p[6]) << 8)  | uint64_t(p[7]);
 }
 
-int main(int argc, char** argv) {
-    (void)argc; (void)argv;
+static bool read_mold_header(const uint8_t* buf, size_t len,
+                            char session10[10], uint64_t& seq, uint16_t& cnt) {
+    if (!buf || len < sizeof(MoldHeaderRaw)) return false;
+    const auto* h = reinterpret_cast<const MoldHeaderRaw*>(buf);
+    std::memcpy(session10, h->session, 10);
+    seq = be64(reinterpret_cast<const uint8_t*>(&h->sequence_number_be));
+    cnt = be16(reinterpret_cast<const uint8_t*>(&h->message_count_be));
+    return true;
+}
 
+int main() {
     std::signal(SIGINT, on_sigint);
 
     try {
@@ -46,16 +65,13 @@ int main(int argc, char** argv) {
     DecodeOptions opt;
     opt.verbose = false;
 
-    // Packet-level output buffer (one write per UDP packet)
-    // Increase if you ever expect very large packet message_count + verbose.
+    // one write per UDP packet
     alignas(64) static char outbuf[256 * 1024];
 
-#if defined(__linux__)
-    // --- Batch receive setup ---
-    constexpr int BATCH = 32;    // tune: 16/32/64
-    constexpr int MTU   = 65536; // safe upper bound for UDP payload
+    // --- batch receive ---
+    constexpr int BATCH = 32;   // tune: 16/32/64
+    constexpr int MTU   = 65536;
 
-    // Note: alignas on this array may be ignored on some compilers; not critical.
     alignas(64) static uint8_t bufs[BATCH][MTU];
     static struct iovec iov[BATCH];
     static struct mmsghdr msgs[BATCH];
@@ -65,10 +81,11 @@ int main(int argc, char** argv) {
         std::memset(&iov[i], 0, sizeof(iov[i]));
         iov[i].iov_base = bufs[i];
         iov[i].iov_len  = MTU;
-
         msgs[i].msg_hdr.msg_iov = &iov[i];
         msgs[i].msg_hdr.msg_iovlen = 1;
     }
+
+    uint64_t expected_seq = 0;
 
     while (!g_stop) {
         int n = rx.recv_batch(msgs, BATCH);
@@ -78,29 +95,39 @@ int main(int argc, char** argv) {
             size_t bytes = (size_t)msgs[i].msg_len;
             if (bytes == 0) continue;
 
-            size_t outn = decode_moldudp64_packet_to_buffer(
-                bufs[i], bytes, opt, outbuf, sizeof(outbuf));
+            char session10[10];
+            uint64_t seq;
+            uint16_t cnt;
 
+            if (!read_mold_header(bufs[i], bytes, session10, seq, cnt)) continue;
+
+            if (expected_seq == 0) expected_seq = seq;
+
+            // GAP DETECT
+            if (seq > expected_seq) {
+                uint64_t gap = seq - expected_seq;
+                std::cerr << "WARN: GAP expected=" << expected_seq
+                          << " got=" << seq
+                          << " missing=" << gap
+                          << " session=" << std::string(session10, 10)
+                          << "\n";
+
+                // QA-level behavior for now: resync to live
+                expected_seq = seq;
+            } else if (seq < expected_seq) {
+                // stale/duplicate packet
+                continue;
+            }
+
+            // decode + write
+            size_t outn = decode_moldudp64_packet_to_buffer(bufs[i], bytes, opt, outbuf, sizeof(outbuf));
             if (outn) (void)!::write(1, outbuf, outn);
+
+            // advance expected
+            if (cnt != 0xFFFF) expected_seq += cnt;
         }
     }
-#else
-    // Portable fallback (non-Linux): recvfrom one-by-one
-    constexpr int MTU = 65536;
-    alignas(64) static uint8_t buf[MTU];
-
-    while (!g_stop) {
-        int n = rx.recv(buf, MTU);
-        if (n <= 0) continue;
-
-        size_t outn = decode_moldudp64_packet_to_buffer(
-            buf, (size_t)n, opt, outbuf, sizeof(outbuf));
-
-        if (outn) (void)!::write(1, outbuf, outn);
-    }
-#endif
 
     std::cout << "INFO : stopped\n";
     return 0;
 }
-
