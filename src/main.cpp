@@ -2,15 +2,14 @@
 #include "decoder.h"
 #include "socket.h"
 #include "recovery.h"
-
 #include <csignal>
 #include <iostream>
 #include <cstring>
 #include <unistd.h>
 #include <getopt.h>
-
-#include <sys/socket.h> // mmsghdr
-#include <sys/uio.h>    // iovec
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <cstdio>
 
 static volatile std::sig_atomic_t g_stop = 0;
 static void on_sigint(int) { g_stop = 1; }
@@ -52,9 +51,12 @@ static void usage(const char* prog) {
 }
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+
     std::signal(SIGINT, on_sigint);
 
-    bool enable_gap_fill = false;   // live recovery
+    bool enable_gap_fill = false;
     bool verbose = false;
     uint64_t start_seq = 0;
     uint64_t max_msgs = 0;
