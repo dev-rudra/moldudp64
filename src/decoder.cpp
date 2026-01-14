@@ -6,7 +6,6 @@
 #include <string_view>
 #include <stdexcept>
 #include <cstdarg>
-#include <unistd.h>     // write()
 
 #pragma pack(push, 1)
 struct MoldHeaderRaw {
@@ -63,13 +62,8 @@ static inline int append(char*& cur, char* end, const char* fmt, ...) {
     return n;
 }
 
-static inline void append_field(char*& cur, char* end, const uint8_t* msg_base, const FieldSpec& f, const DecodeOptions& opt) {
+static inline void append_field_value_only(char*& cur, char* end, const uint8_t* msg_base, const FieldSpec& f) {
     const uint8_t* p = msg_base + f.offset;
-
-    // leading quote already printed by caller
-    if (opt.verbose) {
-        append(cur, end, "%s: ", f.name.c_str());
-    }
 
     switch (f.type) {
         case FieldType::CHAR:
@@ -87,8 +81,6 @@ static inline void append_field(char*& cur, char* end, const uint8_t* msg_base, 
             append(cur, end, "%llu", (unsigned long long)be64(p));
             break;
         case FieldType::STRING: {
-            // write raw fixed-length bytes into output (sanitized)
-            // avoid printf("%.*s") because it stops at '\0'
             size_t cap = (size_t)(end - cur);
             size_t wrote = append_sanitized_fixed(cur, cap, p, f.size);
             cur += wrote;
@@ -99,6 +91,41 @@ static inline void append_field(char*& cur, char* end, const uint8_t* msg_base, 
             break;
     }
 }
+
+static inline void append_field_kv(char*& cur, char* end, const uint8_t* msg_base, const FieldSpec& f) {
+    const uint8_t* p = msg_base + f.offset;
+
+    append(cur, end, ", '%s': ", f.name.c_str());
+
+    switch (f.type) {
+        case FieldType::CHAR:
+            append(cur, end, "'%c'", (char)p[0]);
+            break;
+        case FieldType::UINT8:
+            append(cur, end, "%u", (unsigned)p[0]);
+            break;
+        case FieldType::UINT32:
+            if (f.size != 4) throw std::runtime_error("UINT32 size != 4 for field: " + f.name);
+            append(cur, end, "%u", be32(p));
+            break;
+        case FieldType::UINT64:
+            if (f.size != 8) throw std::runtime_error("UINT64 size != 8 for field: " + f.name);
+            append(cur, end, "%llu", (unsigned long long)be64(p));
+            break;
+        case FieldType::STRING: {
+            append(cur, end, "'");
+            size_t cap = (size_t)(end - cur);
+            size_t wrote = append_sanitized_fixed(cur, cap, p, f.size);
+            cur += wrote;
+            append(cur, end, "'");
+            break;
+        }
+        default:
+            append(cur, end, "null");
+            break;
+    }
+}
+
 size_t decode_moldudp64_packet_to_buffer(
     const uint8_t* buf, size_t len,
     const DecodeOptions& opt,
@@ -122,9 +149,15 @@ size_t decode_moldudp64_packet_to_buffer(
 
     // End-of-session
     if (cnt == 0xFFFF) {
-        append(cur, end, ">> {'%.*s', %llu, %u}\n",
-                (int)session.size(), session.data(),
-                (unsigned long long)seq, (unsigned)cnt);
+        if (opt.verbose) {
+            append(cur, end, ">> {'session':'%.*s', 'seq':%llu, 'cnt':%u, 'type':'END'}\n",
+                   (int)session.size(), session.data(),
+                   (unsigned long long)seq, (unsigned)cnt);
+        } else {
+            append(cur, end, ">> {'%.*s', %llu, %u}\n",
+                   (int)session.size(), session.data(),
+                   (unsigned long long)seq, (unsigned)cnt);
+        }
         return (size_t)(cur - out);
     }
 
@@ -140,23 +173,39 @@ size_t decode_moldudp64_packet_to_buffer(
         uint8_t msg_type = msg[0];
         const MsgSpec* spec = g_fast_specs[msg_type];
 
-        append(cur, end, ">> {'%.*s', %llu, %u,'%c'",
-                (int)session.size(), session.data(),
-                (unsigned long long)(seq + i),
-                (unsigned)cnt,
-                (char)msg_type);
+        if (opt.verbose) {
+            append(cur, end, ">> {'session':'%.*s', 'seq':%llu, 'cnt':%u, 'type':'%c'",
+                   (int)session.size(), session.data(),
+                   (unsigned long long)(seq + i),
+                   (unsigned)cnt,
+                   (char)msg_type);
 
-        if (spec) {
-            for (const auto& f : spec->fields) {
-                append(cur, end, ", '");
-                append_field(cur, end, msg, f, opt);
-                append(cur, end, "'");
+            if (spec) {
+                for (const auto& f : spec->fields) {
+                    append_field_kv(cur, end, msg, f);
+                }
             }
+
+            append(cur, end, "}\n");
+        } else {
+            append(cur, end, ">> {'%.*s', %llu, %u,'%c'",
+                   (int)session.size(), session.data(),
+                   (unsigned long long)(seq + i),
+                   (unsigned)cnt,
+                   (char)msg_type);
+
+            if (spec) {
+                for (const auto& f : spec->fields) {
+                    append(cur, end, ", '");
+                    append_field_value_only(cur, end, msg, f);
+                    append(cur, end, "'");
+                }
+            }
+
+            append(cur, end, "}\n");
         }
 
-        append(cur, end, "}\n");
         if (cur >= end) break;
-
         off += msg_len;
     }
 

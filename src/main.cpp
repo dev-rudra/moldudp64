@@ -45,8 +45,8 @@ static void usage(const char* prog) {
     std::cerr
         << "Usage: " << prog << " [-g] [-s <seq>] [-n <count>] [-v]\n\n"
         << "Options:\n"
-        << "  -g            Enable gap-fill (rerequest missing sequences)\n"
-        << "  -s <seq>      Start expected sequence at <seq> (implies gap-fill is useful)\n"
+        << "  -g            Live mode with recovery (rerequest on gaps)\n"
+        << "  -s <seq>      Download starting at <seq> using rerequest (session discovered from first live packet)\n"
         << "  -n <count>    Stop after decoding <count> messages (QA testing)\n"
         << "  -v            Verbose decode (field names etc. if decoder supports)\n";
 }
@@ -54,7 +54,7 @@ static void usage(const char* prog) {
 int main(int argc, char** argv) {
     std::signal(SIGINT, on_sigint);
 
-    bool enable_gap_fill = false;   // <-- default OFF (safe)
+    bool enable_gap_fill = false;   // live recovery
     bool verbose = false;
     uint64_t start_seq = 0;
     uint64_t max_msgs = 0;
@@ -66,7 +66,6 @@ int main(int argc, char** argv) {
             case 'g': enable_gap_fill = true; break;
             case 's':
                 start_seq = std::stoull(optarg);
-                // do NOT force enable_gap_fill automatically; user must pass -g
                 break;
             case 'n': max_msgs = std::stoull(optarg); break;
             case 'v': verbose = true; break;
@@ -98,13 +97,20 @@ int main(int argc, char** argv) {
     DecodeOptions opt_dec;
     opt_dec.verbose = verbose;
 
-    // Rerequester (only used if -g passed)
+    const bool start_mode = (start_seq != 0);
+    const bool need_rereq = (enable_gap_fill || start_mode);
+
+    // Rerequester (used for -g and/or -s)
     Rerequester rr;
     bool rr_ok = false;
-    if (enable_gap_fill) {
+    if (need_rereq) {
         rr_ok = rr.open(cfg.net.rerequest_ip.c_str(), cfg.net.rerequest_port);
         if (!rr_ok) {
-            std::cerr << "WARN: gap-fill requested but rerequester open failed; disabling gap-fill\n";
+            if (start_mode) {
+                std::cerr << "FATAL: -s requires rerequest, but rerequester open failed\n";
+                return 1;
+            }
+            std::cerr << "WARN: -g requested but rerequester open failed; disabling recovery\n";
             enable_gap_fill = false;
         }
     }
@@ -132,6 +138,8 @@ int main(int argc, char** argv) {
     uint64_t expected_seq = start_seq;  // 0 means "sync to first packet"
     uint64_t total_msgs = 0;
 
+    bool initial_done = !start_mode;
+
     while (!g_stop) {
         if (max_msgs > 0 && total_msgs >= max_msgs) break;
 
@@ -150,7 +158,67 @@ int main(int argc, char** argv) {
 
             if (!read_mold_header(bufs[i], bytes, session10, seq, cnt)) continue;
 
-            // Sync expected seq to first packet (live mode)
+            // If -s was provided, the first live packet is used to discover session + "current".
+            if (start_mode && !initial_done) {
+                if (expected_seq == 0) expected_seq = 1; // safety; user likely passed -s anyway
+
+                if (cnt == 0xFFFF) {
+                    // ignore END marker while waiting for first real packet
+                    continue;
+                }
+
+                // Initial download via rerequest: [expected_seq .. seq-1]
+                if (rr_ok && seq > expected_seq) {
+                    uint64_t gap = seq - expected_seq;
+
+                    uint64_t remaining = (max_msgs > 0 && total_msgs < max_msgs) ? (max_msgs - total_msgs) : 0;
+                    uint64_t need = gap;
+                    if (max_msgs > 0) {
+                        if (remaining == 0) {
+                            g_stop = 1;
+                            break;
+                        }
+                        if (need > remaining) need = remaining;
+                    }
+
+                    if (need > 0) {
+                        std::cerr << "DOWNLOAD session=" << std::string(session10, 10)
+                                  << " from=" << expected_seq << " count=" << need << "\n";
+
+                        uint64_t rec = rr.recover(session10, expected_seq, need, opt_dec);
+                        total_msgs += rec;
+                        expected_seq += rec;
+                    }
+                }
+
+                // If -n was satisfied by download, stop.
+                if (max_msgs > 0 && total_msgs >= max_msgs) {
+                    g_stop = 1;
+                    break;
+                }
+
+                // Sync to this live packet (best-effort) and decode it.
+                expected_seq = seq;
+
+                size_t outn = decode_moldudp64_packet_to_buffer(bufs[i], bytes, opt_dec, outbuf, sizeof(outbuf));
+                if (outn) (void)!::write(1, outbuf, outn);
+
+                total_msgs += cnt;
+                expected_seq += cnt;
+                initial_done = true;
+
+                // -s without -g: "download then exit"
+                if (!enable_gap_fill) {
+                    if (max_msgs == 0 || total_msgs >= max_msgs) {
+                        g_stop = 1;
+                        break;
+                    }
+                }
+
+                continue;
+            }
+
+            // Live mode: sync expected seq to first packet
             if (expected_seq == 0) expected_seq = seq;
 
             // End session marker (optional)
@@ -169,7 +237,18 @@ int main(int argc, char** argv) {
                           << " count=" << gap << "\n";
 
                 if (enable_gap_fill && rr_ok) {
-                    uint64_t rec = rr.recover(session10, expected_seq, gap, opt_dec);
+                    uint64_t remaining = (max_msgs > 0 && total_msgs < max_msgs) ? (max_msgs - total_msgs) : 0;
+                    uint64_t need = gap;
+                    if (max_msgs > 0) {
+                        if (remaining == 0) {
+                            g_stop = 1;
+                            break;
+                        }
+                        if (need > remaining) need = remaining;
+                    }
+
+                    uint64_t rec = rr.recover(session10, expected_seq, need, opt_dec);
+                    total_msgs += rec;
                     expected_seq += rec;
 
                     if (rec < gap) {
@@ -192,6 +271,11 @@ int main(int argc, char** argv) {
             // Count & advance state
             total_msgs += cnt;
             expected_seq += cnt;
+
+            if (max_msgs > 0 && total_msgs >= max_msgs) {
+                g_stop = 1;
+                break;
+            }
         }
     }
 
