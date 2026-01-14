@@ -38,6 +38,9 @@ static inline uint64_t be64(const uint8_t* p) {
     return (uint64_t(p[0]) << 56) | (uint64_t(p[1]) << 48) | (uint64_t(p[2]) << 40) | (uint64_t(p[3]) << 32) |
            (uint64_t(p[4]) << 24) | (uint64_t(p[5]) << 16) | (uint64_t(p[6]) << 8)  | uint64_t(p[7]);
 }
+static inline int16_t i16be(const uint8_t* p) { return (int16_t)be16(p); }
+static inline int32_t i32be(const uint8_t* p) { return (int32_t)be32(p); }
+static inline int64_t i64be(const uint8_t* p) { return (int64_t)be64(p); }
 
 // No allocations: print fixed strings directly with precision, replace '\0' with space while copying into output.
 static inline size_t append_sanitized_fixed(char* out, size_t cap, const uint8_t* p, size_t n) {
@@ -72,13 +75,31 @@ static inline void append_field_value_only(char*& cur, char* end, const uint8_t*
         case FieldType::UINT8:
             append(cur, end, "%u", (unsigned)p[0]);
             break;
+        case FieldType::UINT16:
+            if (f.size != 2) throw std::runtime_error("UINT16 size != 2 for field: " + f.name);
+            append(cur, end, "%u", (unsigned)be16(p));
+            break;
+        case FieldType::INT16:
+            if (f.size != 2) throw std::runtime_error("INT16 size != 2 for field: " + f.name);
+            append(cur, end, "%d", (int)i16be(p));
+            break;
+        case FieldType::INT32:
+            if (f.size != 4) throw std::runtime_error("INT32 size != 4 for field: " + f.name);
+            append(cur, end, "%d", (int)i32be(p));
+            break;
         case FieldType::UINT32:
             if (f.size != 4) throw std::runtime_error("UINT32 size != 4 for field: " + f.name);
             append(cur, end, "%u", be32(p));
             break;
+        case FieldType::INT64:
+            if (f.size != 8) throw std::runtime_error("INT64 size != 8 for field: " + f.name);
+            append(cur, end, "%lld", (long long)i64be(p));
+            break;
         case FieldType::UINT64:
             if (f.size != 8) throw std::runtime_error("UINT64 size != 8 for field: " + f.name);
             append(cur, end, "%llu", (unsigned long long)be64(p));
+            break;
+        case FieldType::BINARY:
             break;
         case FieldType::STRING: {
             size_t cap = (size_t)(end - cur);

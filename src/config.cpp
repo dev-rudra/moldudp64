@@ -21,9 +21,17 @@ static std::string trim(std::string s) {
 static FieldType parse_field_type(const std::string& t) {
     if (t == "char")   return FieldType::CHAR;
     if (t == "uint8")  return FieldType::UINT8;
+    if (t == "uint16") return FieldType::UINT16;
     if (t == "uint32") return FieldType::UINT32;
     if (t == "uint64") return FieldType::UINT64;
+
+    if (t == "int16")  return FieldType::INT16;
+    if (t == "int32")  return FieldType::INT32;
+    if (t == "int64")  return FieldType::INT64;
+    
     if (t == "string") return FieldType::STRING;
+    if (t == "binary") return FieldType::BINARY;
+
     throw std::runtime_error("Unknown field type: " + t);
 }
 

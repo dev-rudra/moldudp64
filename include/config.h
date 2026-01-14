@@ -17,9 +17,14 @@ struct NetConfig {
 enum class FieldType : uint8_t {
     CHAR,
     UINT8,
+    UINT16,
     UINT32,
     UINT64,
-    STRING
+    INT16,
+    INT32,
+    INT64,
+    STRING,
+    BINARY
 };
 
 struct FieldSpec {
