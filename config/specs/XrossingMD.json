@@ -41,7 +41,7 @@
             {"name": "TimestampNanoseconds",    "type": "uint64",   "size": 8},
             {"name": "SecurityId",              "type": "string",   "size": 4},
             {"name": "MarketCode",              "type": "string",   "size": 4},
-            {"name": "ReferencePrice",          "type": "string",   "size": 8},
+            {"name": "ReferencePrice",          "type": "uint64",   "size": 8},
             {"name": "UpperPriceLimit",         "type": "uint64",   "size": 8},
             {"name": "LowerPriceLimit",         "type": "uint64",   "size": 8}
         ]
