@@ -98,9 +98,12 @@ int main(int argc, char** argv) {
     opt_dec.verbose = verbose;
 
     const bool start_mode = (start_seq != 0);
-    const bool need_rereq = (enable_gap_fill || start_mode);
 
-    // Rerequester (used for -g and/or -s)
+    const bool auto_start_recover_enabled = true;
+
+    const bool need_rereq = (enable_gap_fill || start_mode || auto_start_recover_enabled);
+
+    // Rerequester (used for -g, -s, and optional auto-start recovery)
     Rerequester rr;
     bool rr_ok = false;
     if (need_rereq) {
@@ -110,8 +113,10 @@ int main(int argc, char** argv) {
                 std::cerr << "FATAL: -s requires rerequest, but rerequester open failed\n";
                 return 1;
             }
-            std::cerr << "WARN: -g requested but rerequester open failed; disabling recovery\n";
-            enable_gap_fill = false;
+            if (enable_gap_fill) {
+                std::cerr << "WARN: -g requested but rerequester open failed; disabling recovery\n";
+                enable_gap_fill = false;
+            }
         }
     }
 
@@ -139,6 +144,7 @@ int main(int argc, char** argv) {
     uint64_t total_msgs = 0;
 
     bool initial_done = !start_mode;
+    bool did_auto_start_recover = false;
 
     while (!g_stop) {
         if (max_msgs > 0 && total_msgs >= max_msgs) break;
@@ -158,14 +164,22 @@ int main(int argc, char** argv) {
 
             if (!read_mold_header(bufs[i], bytes, session10, seq, cnt)) continue;
 
+            // End of Session 
+            // >> {'1234567891', 4345, 65535}
+            if (cnt == 0xFFFF) {
+                char line[128];
+                int  l = std::snprintf(line, sizeof(line),
+                                       ">> {'%.*s', %llu, %u}\n",
+                                       10, session10,
+                                       (unsigned long long)seq,
+                                       (unsigned)cnt);
+                if (l > 0) (void)!::write(1, line, (size_t)l);
+                continue;
+            }
+
             // If -s was provided, the first live packet is used to discover session + "current".
             if (start_mode && !initial_done) {
                 if (expected_seq == 0) expected_seq = 1; // safety; user likely passed -s anyway
-
-                if (cnt == 0xFFFF) {
-                    // ignore END marker while waiting for first real packet
-                    continue;
-                }
 
                 // Initial download via rerequest: [expected_seq .. seq-1]
                 if (rr_ok && seq > expected_seq) {
@@ -218,15 +232,29 @@ int main(int argc, char** argv) {
                 continue;
             }
 
+            // one-time auto-start recovery in pure live mode.
+            // If we miss the initial burst and our first packet is seq>1, recover [1..seq-1] once.
+            if (!start_mode && auto_start_recover_enabled && !did_auto_start_recover) {
+                if (expected_seq == 0 && rr_ok && seq > 1) {
+                    uint64_t remaining = (max_msgs > 0 && total_msgs < max_msgs) ? (max_msgs - total_msgs) : 0;
+                    uint64_t need = seq - 1;
+                    if (max_msgs > 0) {
+                        if (remaining == 0) { g_stop = 1; break; }
+                        if (need > remaining) need = remaining;
+                    }
+
+                    if (need > 0) {
+                        std::cerr << "AUTO-START-RECOVERY session=" << std::string(session10, 10)
+                                  << " from=1 count=" << need << "\n";
+                        uint64_t rec = rr.recover(session10, 1, need, opt_dec);
+                        total_msgs += rec;
+                    }
+                }
+                did_auto_start_recover = true;
+            }
+
             // Live mode: sync expected seq to first packet
             if (expected_seq == 0) expected_seq = seq;
-
-            // End session marker (optional)
-            if (cnt == 0xFFFF) {
-                std::cerr << "INFO: END session=" << std::string(session10, 10)
-                          << " seq=" << seq << "\n";
-                continue;
-            }
 
             // GAP detection
             if (seq > expected_seq) {
@@ -282,3 +310,4 @@ int main(int argc, char** argv) {
     std::cerr << "INFO: stopped msgs=" << total_msgs << " expected_seq=" << expected_seq << "\n";
     return 0;
 }
+
