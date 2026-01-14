@@ -1,6 +1,6 @@
 #include "recovery.h"
 #include "decoder.h"
-
+#include "config.h"
 #include <cstring>
 #include <cerrno>
 #include <endian.h>
@@ -78,7 +78,7 @@ uint64_t Rerequester::recover(const char session10[10],
     uint64_t cur_seq = start_seq;
     uint64_t remaining = count;
 
-    const uint16_t MAX_PER_REQ = 5000; // QA safety cap
+    const uint16_t MAX_PER_REQ = config().recovery.max_recovery_message_count; 
 
     while (remaining > 0) {
         uint16_t req = (remaining > MAX_PER_REQ) ? MAX_PER_REQ : (uint16_t)remaining;

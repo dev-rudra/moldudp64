@@ -14,6 +14,10 @@ struct NetConfig {
     uint16_t    rerequest_port;
 };
 
+struct RecoverySettings {
+    uint16_t max_recovery_message_count = 5000;
+}
+
 enum class FieldType : uint8_t {
     CHAR,
     UINT8,
@@ -42,6 +46,7 @@ struct MsgSpec {
 
 struct AppConfig {
     NetConfig net;
+    RecoverySettings recovery;
     std::unordered_map<char, MsgSpec> msg_specs;
 };
 

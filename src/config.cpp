@@ -1,11 +1,11 @@
 #include "config.h"
-
 #include <fstream>
 #include <stdexcept>
 #include <string>
 #include <cstdint>
 #include <sys/stat.h>
 #include <unistd.h> 
+#include <cctype>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -39,6 +39,11 @@ static std::string join_path(const std::string& dir, const std::string& rel) {
     if (dir.empty() || dir == ".") return rel;
     if (dir.back() == '/' || dir.back() == '\\') return dir + rel;
     return dir + "/" + rel;
+}
+
+static std::string to_lower(std::string s) {
+    for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+    return s;
 }
 
 static FieldType parse_field_type(const std::string& t) {
@@ -156,9 +161,17 @@ void load_config(const char* ini_path) {
     std::string spec_rel;
     std::string line;
 
+    // for flat ini without section
+    std::string section;
+
     while (std::getline(f, line)) {
         line = trim(line);
         if (line.empty() || line[0] == '#' || line[0] == ';' || line[0] == '[') continue;
+
+        if (line.front() == '[' && line.back() == ']') {
+            section = to_lower(trim(line.substr(1, line.size() - 2)));
+            continue;
+        }
 
         auto pos = line.find(':');
         if (pos == std::string::npos) continue;
@@ -166,13 +179,23 @@ void load_config(const char* ini_path) {
         std::string key = trim(line.substr(0, pos));
         std::string val = trim(line.substr(pos + 1));
 
-        if      (key == "mcast_ip")               g_cfg.net.mcast_ip = val;
-        else if (key == "mcast_port")             g_cfg.net.mcast_port = (uint16_t)std::stoi(val);
-        else if (key == "mcast_source_ip")        g_cfg.net.mcast_source_ip = val;
-        else if (key == "interface_ip")           g_cfg.net.interface_ip = val;
-        else if (key == "mcast_rerequester_ip")   g_cfg.net.rerequest_ip = val;
-        else if (key == "mcast_rerequester_port") g_cfg.net.rerequest_port = (uint16_t)std::stoi(val);
-        else if (key == "protocol_spec")          spec_rel = val;
+        // FEED_CHANNELS SECTION
+        if (section.empty() || section == "feed_channels") {
+            if      (key == "mcast_ip")               g_cfg.net.mcast_ip = val;
+            else if (key == "mcast_port")             g_cfg.net.mcast_port = (uint16_t)std::stoi(val);
+            else if (key == "mcast_source_ip")        g_cfg.net.mcast_source_ip = val;
+            else if (key == "interface_ip")           g_cfg.net.interface_ip = val;
+            else if (key == "mcast_rerequester_ip")   g_cfg.net.rerequest_ip = val;
+            else if (key == "mcast_rerequester_port") g_cfg.net.rerequest_port = (uint16_t)std::stoi(val);
+            else if (key == "protocol_spec")          spec_rel = val;
+        }
+
+        // RECOVERY_SETTINGS SECTION
+        if (section == "recovery_settings") {
+            if (key == "max_recovery_message_count") {
+                g_cfg.recovery.max_recovery_message_count = (uint16_t)std::stoi(val);
+            }
+        }
     }
 
     if (spec_rel.empty()) throw std::runtime_error("protocol_spec not found in ini");
