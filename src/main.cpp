@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <cstdio>
+#include <time.h>
 
 static volatile std::sig_atomic_t g_stop = 0;
 static void on_sigint(int) { g_stop = 1; }
@@ -48,6 +49,18 @@ static void usage(const char* prog) {
         << "  -s <seq>      Download starting at <seq> using rerequest (session discovered from first live packet)\n"
         << "  -n <count>    Stop after decoding <count> messages (QA testing)\n"
         << "  -v            Verbose decode (field names etc. if decoder supports)\n";
+}
+
+// rate-limit helper (monotonic ms) for partial recovery warnings only
+static bool should_log_every_ms(uint64_t& last_ms, uint64_t interval_ms) {
+    struct timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+    if (now_ms - last_ms >= interval_ms) {
+        last_ms = now_ms;
+        return true;
+    }
+    return false;
 }
 
 int main(int argc, char** argv) {
@@ -93,16 +106,14 @@ int main(int argc, char** argv) {
         std::cerr << "FATAL: multicast open failed\n";
         return 1;
     }
-    rx.set_rcvbuf(4 * 1024 * 1024);
+    rx.set_rcvbuf(16 * 1024 * 1024); 
 
     // Decoder options
     DecodeOptions opt_dec;
     opt_dec.verbose = verbose;
 
     const bool start_mode = (start_seq != 0);
-
     const bool auto_start_recover_enabled = true;
-
     const bool need_rereq = (enable_gap_fill || start_mode || auto_start_recover_enabled);
 
     // Rerequester (used for -g, -s, and optional auto-start recovery)
@@ -148,6 +159,9 @@ int main(int argc, char** argv) {
     bool initial_done = !start_mode;
     bool did_auto_start_recover = false;
 
+    // rate-limit timer for partial recovery warnings
+    uint64_t last_partial_log_ms = 0;
+
     while (!g_stop) {
         if (max_msgs > 0 && total_msgs >= max_msgs) break;
 
@@ -166,7 +180,7 @@ int main(int argc, char** argv) {
 
             if (!read_mold_header(bufs[i], bytes, session10, seq, cnt)) continue;
 
-            // End of Session 
+            // End of Session
             // >> {'1234567891', 4345, 65535}
             if (cnt == 0xFFFF) {
                 char line[128];
@@ -204,6 +218,12 @@ int main(int argc, char** argv) {
                         uint64_t rec = rr.recover(session10, expected_seq, need, opt_dec);
                         total_msgs += rec;
                         expected_seq += rec;
+
+                        // rate-limited partial recovery warning (download path)
+                        if (rec < need && should_log_every_ms(last_partial_log_ms, 1000)) {
+                            std::cerr << "WARN: RECOVERY partial recovered=" << rec
+                                      << " still_missing=" << (need - rec) << "\n";
+                        }
                     }
                 }
 
@@ -250,6 +270,12 @@ int main(int argc, char** argv) {
                                   << " from=1 count=" << need << "\n";
                         uint64_t rec = rr.recover(session10, 1, need, opt_dec);
                         total_msgs += rec;
+
+                        //  rate-limited partial recovery warning (auto-start path)
+                        if (rec < need && should_log_every_ms(last_partial_log_ms, 1000)) {
+                            std::cerr << "WARN: RECOVERY partial recovered=" << rec
+                                      << " still_missing=" << (need - rec) << "\n";
+                        }
                     }
                 }
                 did_auto_start_recover = true;
@@ -281,9 +307,10 @@ int main(int argc, char** argv) {
                     total_msgs += rec;
                     expected_seq += rec;
 
-                    if (rec < gap) {
+                    // rate-limited partial recovery warning (gap-fill path)
+                    if (rec < need && should_log_every_ms(last_partial_log_ms, 1000)) {
                         std::cerr << "WARN: RECOVERY partial recovered=" << rec
-                                  << " still_missing=" << (gap - rec) << "\n";
+                                  << " still_missing=" << (need - rec) << "\n";
                     }
                 }
 
@@ -312,4 +339,3 @@ int main(int argc, char** argv) {
     std::cerr << "INFO: stopped msgs=" << total_msgs << " expected_seq=" << expected_seq << "\n";
     return 0;
 }
-
