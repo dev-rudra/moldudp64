@@ -150,7 +150,7 @@ size_t decode_moldudp64_packet_to_buffer(
     // End-of-session
     if (cnt == 0xFFFF) {
         if (opt.verbose) {
-            append(cur, end, ">> {'session':'%.*s', 'seq':%llu, 'cnt':%u, 'type':'END'}\n",
+            append(cur, end, ">> {'Session':'%.*s', 'SeqNum':%llu, 'MsgCount':%u, 'end':true}\n",
                    (int)session.size(), session.data(),
                    (unsigned long long)seq, (unsigned)cnt);
         } else {
@@ -174,11 +174,10 @@ size_t decode_moldudp64_packet_to_buffer(
         const MsgSpec* spec = g_fast_specs[msg_type];
 
         if (opt.verbose) {
-            append(cur, end, ">> {'session':'%.*s', 'seq':%llu, 'cnt':%u, 'type':'%c'",
+            append(cur, end, ">> {'Session':'%.*s', 'SeqNum':%llu, 'MsgCount':%u",
                    (int)session.size(), session.data(),
                    (unsigned long long)(seq + i),
-                   (unsigned)cnt,
-                   (char)msg_type);
+                   (unsigned)cnt);
 
             if (spec) {
                 for (const auto& f : spec->fields) {
@@ -188,11 +187,10 @@ size_t decode_moldudp64_packet_to_buffer(
 
             append(cur, end, "}\n");
         } else {
-            append(cur, end, ">> {'%.*s', %llu, %u,'%c'",
+            append(cur, end, ">> {'%.*s', %llu, %u",
                    (int)session.size(), session.data(),
                    (unsigned long long)(seq + i),
-                   (unsigned)cnt,
-                   (char)msg_type);
+                   (unsigned)cnt);
 
             if (spec) {
                 for (const auto& f : spec->fields) {
