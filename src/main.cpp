@@ -106,19 +106,16 @@ int main(int argc, char** argv) {
         std::cerr << "FATAL: multicast open failed\n";
         return 1;
     }
-    rx.set_rcvbuf(16 * 1024 * 1024); 
+    rx.set_rcvbuf(16 * 1024 * 1024);
 
     // Decoder options
     DecodeOptions opt_dec;
     opt_dec.verbose = verbose;
 
     const bool start_mode = (start_seq != 0);
-
-    // Auto-start recovery only with -g is enabled
-    const bool auto_start_recover_enabled = enable_gap_fill;
     const bool need_rereq = (enable_gap_fill || start_mode);
 
-    // Rerequester (used for -g, -s, and optional auto-start recovery)
+    // Rerequester (used for -g and/or -s)
     Rerequester rr;
     bool rr_ok = false;
     if (need_rereq) {
@@ -155,11 +152,14 @@ int main(int argc, char** argv) {
         msgs[i].msg_hdr.msg_iovlen = 1;
     }
 
-    uint64_t expected_seq = start_seq;  // 0 means "sync to first packet"
+    uint64_t expected_seq = start_seq;  // 0 means "sync to first packet" (but we prevent pre-join backfill)
     uint64_t total_msgs = 0;
 
     bool initial_done = !start_mode;
-    bool did_auto_start_recover = false;
+
+    // NEW: In pure live mode (no -s), we "join" on the first live packet.
+    // This prevents -g from backfilling history before we joined.
+    bool joined_live = start_mode;
 
     // rate-limit timer for partial recovery warnings
     uint64_t last_partial_log_ms = 0;
@@ -256,37 +256,23 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            // one-time auto-start recovery in pure live mode.
-            // If we miss the initial burst and our first packet is seq>1, recover [1..seq-1] once.
-            if (!start_mode && auto_start_recover_enabled && !did_auto_start_recover) {
-                if (expected_seq == 0 && rr_ok && seq > 1) {
-                    uint64_t remaining = (max_msgs > 0 && total_msgs < max_msgs) ? (max_msgs - total_msgs) : 0;
-                    uint64_t need = seq - 1;
-                    if (max_msgs > 0) {
-                        if (remaining == 0) { g_stop = 1; break; }
-                        if (need > remaining) need = remaining;
-                    }
+            // NEW: Always-on join gating for pure live mode (no -s).
+            // The first live packet defines our starting point. We never recover anything before join.
+            if (!start_mode && !joined_live) {
+                joined_live = true;
 
-                    if (need > 0) {
-                        std::cerr << "AUTO-START-RECOVERY session=" << std::string(session10, 10)
-                                  << " from=1 count=" << need << "\n";
-                        uint64_t rec = rr.recover(session10, 1, need, opt_dec);
-                        total_msgs += rec;
+                // decode/print the packet we actually received
+                size_t outn = decode_moldudp64_packet_to_buffer(bufs[i], bytes, opt_dec, outbuf, sizeof(outbuf));
+                if (outn) (void)!::write(1, outbuf, outn);
 
-                        //  rate-limited partial recovery warning (auto-start path)
-                        if (rec < need && should_log_every_ms(last_partial_log_ms, 1000)) {
-                            std::cerr << "WARN: RECOVERY partial recovered=" << rec
-                                      << " still_missing=" << (need - rec) << "\n";
-                        }
-                    }
-                }
-                did_auto_start_recover = true;
+                total_msgs += cnt;
+
+                // next expected starts AFTER this packet
+                expected_seq = seq + cnt;
+                continue;
             }
 
-            // Live mode: sync expected seq to first packet
-            if (expected_seq == 0) expected_seq = seq;
-
-            // GAP detection
+            // GAP detection (after join)
             if (seq > expected_seq) {
                 uint64_t gap = seq - expected_seq;
 
@@ -316,7 +302,7 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                // Sync to live packet after recovery attempt
+                // Sync to live packet after recovery attempt (or after logging gap if -g not enabled)
                 expected_seq = seq;
             } else if (seq < expected_seq) {
                 // stale/duplicate
