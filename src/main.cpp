@@ -113,8 +113,10 @@ int main(int argc, char** argv) {
     opt_dec.verbose = verbose;
 
     const bool start_mode = (start_seq != 0);
-    const bool auto_start_recover_enabled = true;
-    const bool need_rereq = (enable_gap_fill || start_mode || auto_start_recover_enabled);
+
+    // Auto-start recovery only with -g is enabled
+    const bool auto_start_recover_enabled = enable_gap_fill;
+    const bool need_rereq = (enable_gap_fill || start_mode);
 
     // Rerequester (used for -g, -s, and optional auto-start recovery)
     Rerequester rr;
